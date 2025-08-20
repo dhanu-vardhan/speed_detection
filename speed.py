@@ -1,238 +1,140 @@
-import os
 import cv2
+import os
 import csv
-import time
 import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
 
-# =========================
-# CONFIGURATION
-# =========================
-MODEL_PATH = "yolov8n.pt"
-VIDEO_PATH = "/Users/anthapuvivekanandareddy/Desktop/Speed_detection/input_data/speed_video_1.mp4"
+# === Parameters ===
+VIDEO_PATH = "/Users/anthapuvivekanandareddy/Desktop/Speed_detection/PT_MODELS/speed_video_1.mp4"
+MODEL_PATH = "/Users/anthapuvivekanandareddy/Desktop/Speed_detection/PT_MODELS/yolov8n.pt"
+CSV_OUTPUT = "/Users/anthapuvivekanandareddy/Desktop/Speed_detection/output.csv"   # ✅ must be a file
+SNAPSHOT_DIR = "/Users/anthapuvivekanandareddy/Desktop/Speed_detection/snapshots"
 
-# Polygon ROI (adjust manually for your scene)
-POLYGON_POINTS = np.array([
-    (300, 700),
-    (1200, 1050),
-    (1600, 760),
-    (900, 600)
-], np.int32)
+FPS = 59
+FRAME_SKIP = 2
+REAL_DISTANCE_METERS = 25
+PIXEL_DISTANCE_REF = 414
+SPEED_LIMIT_KMPH = 40
+SPEED_MIN = 0
+SPEED_MAX = 300
 
-# Entry & Exit lines (inside polygon)
-ENTRY_LINE = ((1600, 760), (900, 600))   # Yellow
-EXIT_LINE  = ((300, 700), (1200, 1050))  # Red
+ROI_POLYGON = [(902, 599), (476, 669), (1186, 997), (1550, 765)]
 
-# Real-world distance between lines (meters)
-DISTANCE_METERS_BETWEEN_LINES = 10.0
+CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+CLASS_IDS = list(CLASS_NAMES.keys())
+CSV_HEADER = ['object_id', 'class_name', 'speed_kmph', 'direction', 'timestamp', 'date', 'snapshot_path']
 
-# Skip frames for performance
-FRAME_SKIP = 1
+# === Initialization ===
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+cap = cv2.VideoCapture(VIDEO_PATH)
+model = YOLO(MODEL_PATH)
+frame_num = 0
 
-# Vehicle classes (COCO: car, motorcycle, bus, truck)
-VEHICLE_CLASSES = [2, 3, 5, 7]
-CLASS_NAMES = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
+object_tracks = {}
+object_speeds = {}
+logged_objects = set()   # ✅ track which vehicles already logged
+csv_rows = []
 
-# Speed limit
-SPEED_LIMIT_KMPH = 10.0
+# === Main Processing Loop ===
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-# Output paths
-OUTPUT_DIR = "./violations"
-CSV_LOG_PATH = "./vehicles_log.csv"
+    frame_num += 1
+    if frame_num % FRAME_SKIP != 0:
+        continue
 
-# Tracking
-MAX_TRACK_LOSS_FRAMES = 40
-MATCH_DISTANCE_PX = 80
-NEAR_LINE_THRESHOLD_PX = 30
+    results = model.track(frame, persist=True, classes=CLASS_IDS, verbose=False)
+    if not results or not results[0].boxes:
+        continue
 
-# =========================
-# UTILS
-# =========================
-def ensure_dirs():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    boxes = results[0].boxes
+    ids = boxes.id
+    if ids is None:
+        continue
 
-def init_csv(path):
-    if not os.path.exists(path):
-        with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["UID", "timestamp", "vehicle_class", "speed_kmph", "snapshot_path"])
+    ids = ids.int().tolist()
+    class_ids = boxes.cls.int().tolist()
+    coords = boxes.xyxy.cpu().numpy()
 
-def log_vehicle(uid, vehicle_class, speed_kmph, snapshot_path=""):
-    ts = datetime.now().isoformat(timespec="seconds")
-    with open(CSV_LOG_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([uid, ts, vehicle_class, f"{speed_kmph:.2f}", snapshot_path])
-
-def point_in_polygon(point, polygon):
-    return cv2.pointPolygonTest(polygon, point, False) >= 0
-
-def distance_point_to_segment(p, a, b):
-    p, a, b = np.array(p, float), np.array(a, float), np.array(b, float)
-    ab = b - a
-    if np.allclose(ab, 0):
-        return np.linalg.norm(p - a)
-    t = np.clip(np.dot(p - a, ab) / np.dot(ab, ab), 0.0, 1.0)
-    proj = a + t * ab
-    return np.linalg.norm(p - proj)
-
-def is_on_line(centroid, line, threshold=NEAR_LINE_THRESHOLD_PX):
-    return distance_point_to_segment(centroid, line[0], line[1]) <= threshold
-
-def side_of_line(point, line):
-    (x1, y1), (x2, y2) = line
-    (x, y) = point
-    return (x - x1) * (y2 - y1) - (y - y1) * (x2 - x1)
-
-def draw_polygon(frame, polygon, color=(255, 255, 0)):
-    cv2.polylines(frame, [polygon], True, color, 3)
-
-def draw_line(frame, line, color, text):
-    cv2.line(frame, line[0], line[1], color, 3)
-    cv2.putText(frame, text, (line[0][0] - 50, line[0][1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-def safe_crop(frame, bbox, pad=4):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-    x2, y2 = min(w - 1, x2 + pad), min(h - 1, y2 + pad)
-    return frame[y1:y2, x1:x2]
-
-# =========================
-# MAIN
-# =========================
-def main():
-    ensure_dirs()
-    init_csv(CSV_LOG_PATH)
-
-    model = YOLO(MODEL_PATH)
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-    tracks, next_uid, frame_idx = {}, 0, 0
-    entry_dir = lambda c: np.sign(side_of_line(c, ENTRY_LINE))
-    exit_dir  = lambda c: np.sign(side_of_line(c, EXIT_LINE))
-
-    print("🚦 Vehicle Speed Detection + Logging + Violations")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_idx += 1
-        if (frame_idx - 1) % FRAME_SKIP != 0:
+    for i in range(len(coords)):
+        obj_id = ids[i]
+        class_id = class_ids[i]
+        class_name = CLASS_NAMES.get(class_id)
+        if class_name is None:
             continue
 
-        results = model(frame, verbose=False)[0]
-        dets = results.boxes.data.cpu().numpy() if results.boxes is not None else []
+        x1, y1, x2, y2 = map(int, coords[i])
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-        # Filter vehicles inside ROI
-        current = []
-        for d in dets:
-            x1, y1, x2, y2, conf, cls = d
-            cls = int(cls)
-            if conf < 0.5 or cls not in VEHICLE_CLASSES:
-                continue
-            cx, cy = int((x1+x2)/2), int((y1+y2)/2)
-            if not point_in_polygon((cx, cy), POLYGON_POINTS):
-                continue
-            current.append({"bbox": (int(x1), int(y1), int(x2), int(y2)),
-                            "centroid": (cx, cy), "class_id": cls})
+        if cv2.pointPolygonTest(np.array(ROI_POLYGON, np.int32), (cx, cy), False) < 0:
+            continue
 
-        # Match detections to tracks
-        unmatched_tracks = set(tracks.keys())
-        for det in current:
-            cx, cy = det["centroid"]
-            best_id, best_dist = None, float("inf")
-            for vid in list(unmatched_tracks):
-                px, py = tracks[vid]["centroid"]
-                dist = np.hypot(cx - px, cy - py)
-                if dist < MATCH_DISTANCE_PX and dist < best_dist:
-                    best_dist, best_id = dist, vid
-            if best_id is None:
-                next_uid += 1
-                vid = next_uid
-                tracks[vid] = {"uid": vid, "centroid": (cx, cy), "bbox": det["bbox"],
-                               "class_id": det["class_id"], "last_seen": frame_idx,
-                               "entry_frame": None, "exit_frame": None,
-                               "entry_side": entry_dir((cx, cy)),
-                               "exit_side": exit_dir((cx, cy)),
-                               "has_logged": False, "has_violation": False}
-            else:
-                tracks[best_id].update({"centroid": (cx, cy), "bbox": det["bbox"],
-                                        "class_id": det["class_id"], "last_seen": frame_idx})
-                unmatched_tracks.discard(best_id)
+        if obj_id not in object_tracks:
+            object_tracks[obj_id] = [(frame_num, cy)]
+        else:
+            object_tracks[obj_id].append((frame_num, cy))
 
-        # Drop stale tracks
-        for vid in list(tracks.keys()):
-            if frame_idx - tracks[vid]["last_seen"] > MAX_TRACK_LOSS_FRAMES:
-                tracks.pop(vid)
+            if len(object_tracks[obj_id]) >= 2:
+                f1, y1_ = object_tracks[obj_id][-2]
+                f2, y2_ = object_tracks[obj_id][-1]
 
-        # Crossing + speed calculation
-        for vid, t in tracks.items():
-            cx, cy, c = *t["centroid"], t["centroid"]
+                pixel_movement = abs(y2_ - y1_)
+                if pixel_movement > 0:
+                    meters_moved = (pixel_movement / PIXEL_DISTANCE_REF) * REAL_DISTANCE_METERS
+                    time_elapsed = (f2 - f1) * (1 / FPS)
 
-            if t["entry_frame"] is None:
-                cur_side = entry_dir(c)
-                if cur_side != 0 and cur_side != t["entry_side"] and is_on_line(c, ENTRY_LINE):
-                    t["entry_frame"] = frame_idx
-                    t["entry_side"] = cur_side
+                    if time_elapsed > 0:
+                        speed_mps = meters_moved / time_elapsed
+                        speed_kmph = speed_mps * 3.6
 
-            if t["entry_frame"] and not t["exit_frame"]:
-                cur_side = exit_dir(c)
-                if cur_side != 0 and cur_side != t["exit_side"] and is_on_line(c, EXIT_LINE):
-                    t["exit_frame"] = frame_idx
-                    t["exit_side"] = cur_side
+                        if SPEED_MIN < speed_kmph < SPEED_MAX:
+                            object_speeds[obj_id] = speed_kmph
+                            direction = "down" if y2_ > y1_ else "up"
 
-                    frames_taken = (t["exit_frame"] - t["entry_frame"])
-                    time_sec = (frames_taken * FRAME_SKIP) / fps
-                    if time_sec > 0:
-                        speed_kmph = (DISTANCE_METERS_BETWEEN_LINES / time_sec) * 3.6
-                        t["speed_kmph"] = speed_kmph
-                        vclass = CLASS_NAMES.get(t["class_id"], str(t["class_id"]))
+                            # ✅ Log only once per vehicle
+                            if obj_id not in logged_objects:
+                                timestamp = datetime.now().strftime('%H:%M:%S')
+                                date = datetime.now().strftime('%Y-%m-%d')
+                                snapshot_path = ""
 
-                        if not t["has_logged"]:
-                            # Log every vehicle
-                            log_vehicle(t["uid"], vclass, speed_kmph, "")
-                            t["has_logged"] = True
+                                if speed_kmph > SPEED_LIMIT_KMPH:
+                                    snap_name = f"{obj_id}_{int(speed_kmph)}kmph_{timestamp.replace(':','')}.jpg"
+                                    snapshot_path = os.path.join(SNAPSHOT_DIR, snap_name)
+                                    cv2.imwrite(snapshot_path, frame[y1:y2, x1:x2])
+                                    print(f"🚨 OVERSPEED: {class_name} ID:{obj_id} → {speed_kmph:.1f} km/h")
 
-                        if speed_kmph > SPEED_LIMIT_KMPH and not t["has_violation"]:
-                            crop = safe_crop(frame, t["bbox"])
-                            snap_name = f"violation_{t['uid']}_{int(time.time())}.jpg"
-                            snap_path = os.path.join(OUTPUT_DIR, snap_name)
-                            cv2.imwrite(snap_path, crop)
-                            log_vehicle(t["uid"], vclass, speed_kmph, snap_path)
-                            t["has_violation"] = True
+                                csv_rows.append([
+                                    obj_id, class_name, round(speed_kmph, 1),
+                                    direction, timestamp, date, snapshot_path
+                                ])
+                                logged_objects.add(obj_id)   # mark logged ✅
 
-        # ==== DRAWING ====
-        draw_polygon(frame, POLYGON_POINTS)
-        draw_line(frame, ENTRY_LINE, (0, 255, 255), "ENTRY")
-        draw_line(frame, EXIT_LINE, (0, 0, 255), "EXIT")
+        # === Draw Bounding Box & Speed ===
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"{class_name} ID:{obj_id}", (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        for vid, t in tracks.items():
-            if frame_idx - t["last_seen"] > 5: continue
-            x1, y1, x2, y2 = t["bbox"]
-            cx, cy = t["centroid"]
-            vclass = CLASS_NAMES.get(t["class_id"], str(t["class_id"]))
-            label = f"ID:{vid} {vclass}"
-            color = (0, 255, 0)
-            if "speed_kmph" in t:
-                label += f" {t['speed_kmph']:.1f} km/h"
-                color = (0, 0, 255) if t["speed_kmph"] > SPEED_LIMIT_KMPH else (0, 200, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label, (x1, max(20, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            cv2.circle(frame, (cx, cy), 4, (255, 255, 0), -1)
+        if obj_id in object_speeds:
+            cv2.putText(frame, f"{object_speeds[obj_id]:.1f} km/h", (x1, y2 + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        cv2.putText(frame, f"Frame:{frame_idx} FPS:{fps:.1f} Limit:{SPEED_LIMIT_KMPH:.0f} km/h",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (250, 250, 250), 2)
+    cv2.polylines(frame, [np.array(ROI_POLYGON, np.int32)], True, (0, 255, 255), 2)
+    cv2.imshow("Vehicle Speed Detection", frame)
 
-        cv2.imshow("Speed Detection", frame)
-        if cv2.waitKey(1) & 0xFF == 27: break
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print(f"✅ Done. Log: {os.path.abspath(CSV_LOG_PATH)} | Snapshots: {os.path.abspath(OUTPUT_DIR)}")
+# === Cleanup ===
+cap.release()
+cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main()
+# === Save CSV Log ===
+with open(CSV_OUTPUT, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(CSV_HEADER)
+    writer.writerows(csv_rows)
+
+print(f"\n✅ Speed log saved to: {CSV_OUTPUT}")
